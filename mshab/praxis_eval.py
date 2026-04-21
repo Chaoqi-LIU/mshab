@@ -150,6 +150,7 @@ def extend_done_values(dest: list[Any], value: Any, done_mask: np.ndarray) -> No
 def main() -> None:
     args = parse_args()
     ms_asset_dir = resolve_ms_asset_dir(args.ms_asset_dir)
+    os.environ["MS_ASSET_DIR"] = str(ms_asset_dir)
     rearrange_dir = rearrange_root(ms_asset_dir)
     plan_fp = task_plan_path(
         root=rearrange_dir,
