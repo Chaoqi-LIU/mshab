@@ -61,7 +61,7 @@ def resolve_ms_asset_dir(explicit: str | None) -> Path:
     env_value = os.environ.get("MS_ASSET_DIR")
     if env_value:
         return Path(env_value).expanduser().resolve()
-    return Path("~/.maniskill").expanduser().resolve()
+    return Path(__file__).resolve().parents[1] / "data" / "maniskill_assets"
 
 
 def rearrange_root(ms_asset_dir: Path) -> Path:
