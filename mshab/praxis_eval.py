@@ -5,16 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-
-import mshab.envs  # noqa: F401 - registers gym envs
-from mshab.envs.make import EnvConfig, make_env
+from mshab.runtime_bootstrap import load_env_factory
 from praxis_client import PolicyClient
 
 
@@ -53,16 +50,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-videos", type=int, default=0)
     parser.add_argument("--no-save-video", action="store_true")
     return parser.parse_args()
-
-
-def resolve_ms_asset_dir(explicit: str | None) -> Path:
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    env_value = os.environ.get("MS_ASSET_DIR")
-    if env_value:
-        return Path(env_value).expanduser().resolve()
-    return Path(__file__).resolve().parents[1] / "data" / "maniskill_assets"
-
 
 def rearrange_root(ms_asset_dir: Path) -> Path:
     return (
@@ -149,8 +136,7 @@ def extend_done_values(dest: list[Any], value: Any, done_mask: np.ndarray) -> No
 
 def main() -> None:
     args = parse_args()
-    ms_asset_dir = resolve_ms_asset_dir(args.ms_asset_dir)
-    os.environ["MS_ASSET_DIR"] = str(ms_asset_dir)
+    ms_asset_dir, EnvConfig, make_env = load_env_factory(args.ms_asset_dir)
     rearrange_dir = rearrange_root(ms_asset_dir)
     plan_fp = task_plan_path(
         root=rearrange_dir,
