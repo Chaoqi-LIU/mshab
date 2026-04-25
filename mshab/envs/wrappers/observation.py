@@ -28,23 +28,27 @@ class FetchDepthObservationWrapper(gym.ObservationWrapper):
     def observation(self, observation):
         agent_obs = observation["agent"]
         extra_obs = observation["extra"]
-        fetch_head_depth = observation["sensor_data"]["fetch_head"]["depth"].permute(
-            0, 3, 1, 2
-        )
-        fetch_hand_depth = observation["sensor_data"]["fetch_hand"]["depth"].permute(
-            0, 3, 1, 2
-        )
+        fetch_head_rgb = self._camera_rgb(observation, "fetch_head")
+        fetch_hand_rgb = self._camera_rgb(observation, "fetch_hand")
+        fetch_head_depth = self._camera_depth(observation, "fetch_head")
+        fetch_hand_depth = self._camera_depth(observation, "fetch_hand")
 
-        depth_pixels = (
-            dict(
-                all_depth=self._stack_fn([fetch_head_depth, fetch_hand_depth], axis=-3)
-            )
-            if self.cat_pixels
-            else dict(
-                fetch_head_depth=fetch_head_depth,
-                fetch_hand_depth=fetch_hand_depth,
-            )
-        )
+        pixel_obs = {}
+        if self.cat_pixels:
+            if fetch_head_depth is not None and fetch_hand_depth is not None:
+                pixel_obs["all_depth"] = self._stack_fn(
+                    [fetch_head_depth, fetch_hand_depth], axis=-3
+                )
+        else:
+            if fetch_head_rgb is not None:
+                pixel_obs["fetch_head"] = fetch_head_rgb
+            if fetch_hand_rgb is not None:
+                pixel_obs["fetch_hand"] = fetch_hand_rgb
+            if fetch_head_depth is not None:
+                pixel_obs["fetch_head_depth"] = fetch_head_depth
+            if fetch_hand_depth is not None:
+                pixel_obs["fetch_hand_depth"] = fetch_hand_depth
+
         return (
             dict(
                 state=self._cat_fn(
@@ -54,14 +58,44 @@ class FetchDepthObservationWrapper(gym.ObservationWrapper):
                     ],
                     axis=1,
                 ),
-                **depth_pixels,
+                **pixel_obs,
             )
             if self.cat_state
             else dict(
                 agent=agent_obs,
                 extra=extra_obs,
-                **depth_pixels,
+                **pixel_obs,
             )
+        )
+
+    def _camera_rgb(self, observation, camera_name):
+        camera_obs = observation["sensor_data"][camera_name]
+        if "rgb" not in camera_obs:
+            return None
+        rgb = camera_obs["rgb"]
+        if rgb.ndim == 4 and rgb.shape[-1] == 3:
+            rgb = rgb.permute(0, 3, 1, 2)
+        elif not (rgb.ndim == 4 and rgb.shape[1] == 3):
+            raise ValueError(
+                f"Expected {camera_name} rgb as BHWC or BCHW, got {tuple(rgb.shape)}"
+            )
+        if rgb.is_floating_point():
+            return rgb.float()
+        return rgb.float() / 255.0
+
+    def _camera_depth(self, observation, camera_name):
+        camera_obs = observation["sensor_data"][camera_name]
+        if "depth" not in camera_obs:
+            return None
+        depth = camera_obs["depth"]
+        if depth.ndim == 4 and depth.shape[-1] == 1:
+            return depth.permute(0, 3, 1, 2)
+        if depth.ndim == 3:
+            return depth[:, None, ...]
+        if depth.ndim == 4 and depth.shape[1] == 1:
+            return depth
+        raise ValueError(
+            f"Expected {camera_name} depth as BHWC, BHW, or BCHW, got {tuple(depth.shape)}"
         )
 
 

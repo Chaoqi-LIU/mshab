@@ -40,6 +40,23 @@ def recursive_fix_env_kwargs(env_kwargs, inplace=False):
     return env_kwargs
 
 
+def sensor_stack_keys(obs_mode: str, *, cat_pixels: bool) -> List[str]:
+    normalized = str(obs_mode).lower()
+    wants_rgb = "rgb" in normalized
+    wants_depth = "depth" in normalized or normalized == "rgbd"
+    if cat_pixels:
+        return ["all_depth"] if wants_depth else ["fetch_head", "fetch_hand"]
+
+    keys: List[str] = []
+    if wants_rgb:
+        keys.extend(["fetch_head", "fetch_hand"])
+    if wants_depth:
+        keys.extend(["fetch_head_depth", "fetch_hand_depth"])
+    if not keys:
+        keys.extend(["fetch_head_depth", "fetch_hand_depth"])
+    return keys
+
+
 @dataclass
 class EnvConfig:
     env_id: str
@@ -47,7 +64,9 @@ class EnvConfig:
     max_episode_steps: int
 
     make_env: bool = True
-    # NOTE (arth): env supports rgbd, pointcloud, segmentation, etc per ManiSkill; we use depth for provided baselines
+    # NOTE (arth): env supports rgbd, pointcloud, segmentation, etc per ManiSkill.
+    # Praxis eval passes rgb so the remote policy gets the RGB cameras used by
+    # the LeRobot MS-HAB dataset without rendering unused depth maps.
     obs_mode: str = "depth"
     render_mode: str = "all"
     shader_dir: str = "minimal"
@@ -121,10 +140,8 @@ def make_env(
         env = FrameStack(
             env,
             num_stack=env_cfg.frame_stack,
-            stacking_keys=(
-                ["all_depth"]
-                if env_cfg.cat_pixels
-                else ["fetch_head_depth", "fetch_hand_depth"]
+            stacking_keys=sensor_stack_keys(
+                env_cfg.obs_mode, cat_pixels=env_cfg.cat_pixels
             ),
         )
     elif env_cfg.stack is not None:

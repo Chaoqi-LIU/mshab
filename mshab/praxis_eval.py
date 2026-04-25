@@ -14,6 +14,9 @@ import torch
 from mshab.runtime_bootstrap import load_env_factory
 from praxis_client import PolicyClient
 
+EXPECTED_STATE_DIM = 42
+EXPECTED_RGB_SHAPE = (3, 128, 128)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -31,8 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-episodes", type=int, required=True)
     parser.add_argument("--num-envs", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--obs-mode", default="depth")
-    parser.add_argument("--frame-stack", type=int, default=3)
+    parser.add_argument("--obs-mode", default="rgb")
+    parser.add_argument("--frame-stack", type=int, default=1)
     parser.add_argument("--stationary-base", action="store_true")
     parser.add_argument("--stationary-torso", action="store_true")
     parser.add_argument("--stationary-head", dest="stationary_head", action="store_true")
@@ -89,42 +92,78 @@ def to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
-def flatten_depth_stack(value: Any) -> np.ndarray | None:
+def latest_rgb_batch(value: Any, *, key: str) -> np.ndarray | None:
     if value is None:
         return None
-    array = to_numpy(value).astype(np.float32, copy=False)
-    if array.ndim == 5 and array.shape[2] == 1:
-        return array[:, :, 0, :, :]
-    if array.ndim == 4 and array.shape[1] == 1:
-        return array[:, 0, :, :]
+    array = to_numpy(value)
+    if array.ndim == 5:
+        array = array[:, -1]
+    if array.ndim != 4:
+        raise ValueError(f"Expected batched RGB {key} with 4 or 5 dims, got {array.shape}")
+    if array.shape[1] == 3:
+        pass
+    elif array.shape[-1] == 3:
+        array = np.moveaxis(array, -1, 1)
+    else:
+        raise ValueError(
+            f"Expected batched RGB {key} as BCHW or BHWC, got {array.shape}"
+        )
+    if np.issubdtype(array.dtype, np.integer):
+        array = array.astype(np.float32) / 255.0
+    else:
+        array = array.astype(np.float32, copy=False)
+    if tuple(array.shape[1:]) != EXPECTED_RGB_SHAPE:
+        raise ValueError(
+            f"Expected {key} RGB shape (B, {EXPECTED_RGB_SHAPE[0]}, "
+            f"{EXPECTED_RGB_SHAPE[1]}, {EXPECTED_RGB_SHAPE[2]}) after conversion, "
+            f"got {array.shape}. This must match the MS-HAB PolicyIO image shape."
+        )
     return array
+
+
+def _required_rgb_batch(
+    obs: dict[str, Any],
+    pixels: dict[str, Any],
+    key: str,
+) -> np.ndarray:
+    batch = latest_rgb_batch(pixels.get(key, obs.get(key)), key=key)
+    if batch is None:
+        available = sorted(
+            str(obs_key)
+            for obs_key in set(obs) | {f"pixels.{pixels_key}" for pixels_key in pixels}
+        )
+        raise KeyError(
+            "MS-HAB Praxis eval requires RGB keys 'fetch_head' and 'fetch_hand'. "
+            "Use --obs-mode rgb or --obs-mode rgbd. "
+            f"Missing {key!r}; available keys: {available}"
+        )
+    return batch
 
 
 def build_remote_observations(
     obs: dict[str, Any], *, task_description: str
 ) -> list[dict[str, Any]]:
     state_batch = to_numpy(obs["state"]).astype(np.float32, copy=False)
+    if state_batch.ndim != 2 or int(state_batch.shape[1]) != EXPECTED_STATE_DIM:
+        raise ValueError(
+            f"Expected MS-HAB state shape (B, {EXPECTED_STATE_DIM}), "
+            f"got {state_batch.shape}."
+        )
     pixels = obs.get("pixels", {})
     if not isinstance(pixels, dict):
         pixels = {}
-    head_batch = flatten_depth_stack(
-        pixels.get("fetch_head_depth", obs.get("fetch_head_depth"))
-    )
-    hand_batch = flatten_depth_stack(
-        pixels.get("fetch_hand_depth", obs.get("fetch_hand_depth"))
-    )
+    head_batch = _required_rgb_batch(obs, pixels, "fetch_head")
+    hand_batch = _required_rgb_batch(obs, pixels, "fetch_hand")
 
     batch_size = int(state_batch.shape[0])
     observations: list[dict[str, Any]] = []
     for index in range(batch_size):
         item: dict[str, Any] = {
             "observation.state": state_batch[index],
+            "observation.images.fetch_head": head_batch[index],
+            "observation.images.fetch_hand": hand_batch[index],
             "task": task_description,
         }
-        if head_batch is not None:
-            item["observation.images.fetch_head_depth"] = head_batch[index]
-        if hand_batch is not None:
-            item["observation.images.fetch_hand_depth"] = hand_batch[index]
         observations.append(item)
     return observations
 
