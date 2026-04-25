@@ -16,6 +16,7 @@ from praxis_client import PolicyClient
 
 EXPECTED_STATE_DIM = 42
 EXPECTED_RGB_SHAPE = (3, 128, 128)
+_PROGRESS_LOG_INTERVAL_SEC = 15.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target", required=True)
     parser.add_argument("--task-alias", required=True)
+    parser.add_argument("--policy-task", required=True)
     parser.add_argument("--task-description", required=True)
     parser.add_argument("--split", default="val", choices=("train", "val"))
     parser.add_argument("--ms-asset-dir", default=None)
@@ -38,7 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stack", type=int, default=1)
     parser.add_argument("--stationary-base", action="store_true")
     parser.add_argument("--stationary-torso", action="store_true")
-    parser.add_argument("--stationary-head", dest="stationary_head", action="store_true")
+    parser.add_argument(
+        "--stationary-head", dest="stationary_head", action="store_true"
+    )
     parser.add_argument(
         "--no-stationary-head",
         dest="stationary_head",
@@ -54,17 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-save-video", action="store_true")
     return parser.parse_args()
 
+
 def rearrange_root(ms_asset_dir: Path) -> Path:
     return (
-        ms_asset_dir
-        / "data"
-        / "scene_datasets"
-        / "replica_cad_dataset"
-        / "rearrange"
+        ms_asset_dir / "data" / "scene_datasets" / "replica_cad_dataset" / "rearrange"
     )
 
 
-def task_plan_path(*, root: Path, task: str, subtask: str, split: str, target: str) -> Path:
+def task_plan_path(
+    *, root: Path, task: str, subtask: str, split: str, target: str
+) -> Path:
     return root / "task_plans" / task / subtask / split / f"{target}.json"
 
 
@@ -99,7 +102,9 @@ def latest_rgb_batch(value: Any, *, key: str) -> np.ndarray | None:
     if array.ndim == 5:
         array = array[:, -1]
     if array.ndim != 4:
-        raise ValueError(f"Expected batched RGB {key} with 4 or 5 dims, got {array.shape}")
+        raise ValueError(
+            f"Expected batched RGB {key} with 4 or 5 dims, got {array.shape}"
+        )
     if array.shape[1] == 3:
         pass
     elif array.shape[-1] == 3:
@@ -141,7 +146,7 @@ def _required_rgb_batch(
 
 
 def build_remote_observations(
-    obs: dict[str, Any], *, task_description: str
+    obs: dict[str, Any], *, policy_task: str
 ) -> list[dict[str, Any]]:
     state_batch = to_numpy(obs["state"]).astype(np.float32, copy=False)
     if state_batch.ndim != 2 or int(state_batch.shape[1]) != EXPECTED_STATE_DIM:
@@ -162,7 +167,7 @@ def build_remote_observations(
             "observation.state": state_batch[index],
             "observation.images.fetch_head": head_batch[index],
             "observation.images.fetch_hand": hand_batch[index],
-            "task": task_description,
+            "task": policy_task,
         }
         observations.append(item)
     return observations
@@ -171,6 +176,33 @@ def build_remote_observations(
 def extend_done_values(dest: list[Any], value: Any, done_mask: np.ndarray) -> None:
     array = to_numpy(value)
     dest.extend(array[done_mask].tolist())
+
+
+def _running_success_rate(values: list[bool]) -> float:
+    return float(np.mean(values)) if values else 0.0
+
+
+def _emit_progress_line(
+    *,
+    task_alias: str,
+    done_count: int,
+    total_episodes: int,
+    success_once: list[bool],
+    success_at_end: list[bool],
+    loop_start_time: float,
+) -> None:
+    elapsed_s = max(0.0, float(time.time() - loop_start_time))
+    parts = [
+        "MSHAB_EVAL",
+        f"task_alias={task_alias}",
+        f"done={done_count}/{total_episodes}",
+        f"succ_rate={100.0 * _running_success_rate(success_once):.1f}%",
+        f"succ_end={100.0 * _running_success_rate(success_at_end):.1f}%",
+        f"elapsed_s={elapsed_s:.1f}",
+    ]
+    if done_count > 0 and elapsed_s > 0:
+        parts.append(f"{elapsed_s / float(done_count):.2f}s/ep")
+    print(" ".join(parts), flush=True)
 
 
 def main() -> None:
@@ -247,10 +279,20 @@ def main() -> None:
         success_once: list[bool] = []
         success_at_end: list[bool] = []
         lengths: list[int] = []
+        loop_start_time = time.time()
+        last_progress_log_time = loop_start_time
+        _emit_progress_line(
+            task_alias=str(args.task_alias),
+            done_count=0,
+            total_episodes=int(args.num_episodes),
+            success_once=success_once,
+            success_at_end=success_at_end,
+            loop_start_time=loop_start_time,
+        )
 
         while len(lengths) < int(args.num_episodes):
             observations = build_remote_observations(
-                obs, task_description=str(args.task_description)
+                obs, policy_task=str(args.policy_task)
             )
             action = np.asarray(
                 client.predict_observations(
@@ -273,16 +315,38 @@ def main() -> None:
                 extend_done_values(lengths, episode_info["l"], done_mask)
                 extend_done_values(success_once, episode_info["s_o"], done_mask)
                 extend_done_values(success_at_end, episode_info["s_e"], done_mask)
+            now = time.time()
+            if np.any(done_mask) or (
+                now - last_progress_log_time >= _PROGRESS_LOG_INTERVAL_SEC
+            ):
+                _emit_progress_line(
+                    task_alias=str(args.task_alias),
+                    done_count=min(len(lengths), int(args.num_episodes)),
+                    total_episodes=int(args.num_episodes),
+                    success_once=success_once,
+                    success_at_end=success_at_end,
+                    loop_start_time=loop_start_time,
+                )
+                last_progress_log_time = now
 
         limit = int(args.num_episodes)
         sum_rewards = [float(x) for x in sum_rewards[:limit]]
         lengths = [int(x) for x in lengths[:limit]]
         success_once = [bool(x) for x in success_once[:limit]]
         success_at_end = [bool(x) for x in success_at_end[:limit]]
+        _emit_progress_line(
+            task_alias=str(args.task_alias),
+            done_count=len(lengths),
+            total_episodes=limit,
+            success_once=success_once,
+            success_at_end=success_at_end,
+            loop_start_time=loop_start_time,
+        )
         avg_sum_reward = float(np.mean(sum_rewards)) if sum_rewards else 0.0
         avg_episode_length = float(np.mean(lengths)) if lengths else 0.0
         metrics = {
             "task_alias": str(args.task_alias),
+            "policy_task": str(args.policy_task),
             "task_description": str(args.task_description),
             "task_plan_fp": str(plan_fp),
             "spawn_data_fp": str(spawn_fp),
