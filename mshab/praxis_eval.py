@@ -15,6 +15,7 @@ from mshab.runtime_bootstrap import load_env_factory
 from praxis_client import PolicyClient
 
 EXPECTED_STATE_DIM = 42
+EXPECTED_ACTION_DIM = 13
 EXPECTED_RGB_SHAPE = (3, 128, 128)
 _PROGRESS_LOG_INTERVAL_SEC = 15.0
 
@@ -56,6 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-dir", required=True)
     parser.add_argument("--max-videos", type=int, default=0)
     parser.add_argument("--no-save-video", action="store_true")
+    parser.add_argument(
+        "--debug-max-control-steps",
+        type=int,
+        default=None,
+        help=(
+            "Stop after this many env control steps even if no episode has "
+            "finished. Intended for contract diagnostics only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -93,6 +103,163 @@ def to_numpy(value: Any) -> np.ndarray:
     if torch.is_tensor(value):
         return value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def _stat_summary(array: np.ndarray) -> dict[str, Any]:
+    array = np.asarray(array)
+    return {
+        "shape": [int(dim) for dim in array.shape],
+        "dtype": str(array.dtype),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array)),
+    }
+
+
+def summarize_remote_observation_batch(
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not observations:
+        return {}
+    summary: dict[str, Any] = {
+        "batch_size": int(len(observations)),
+        "tasks": sorted({str(item.get("task")) for item in observations}),
+    }
+    for key in (
+        "observation.state",
+        "observation.images.fetch_head",
+        "observation.images.fetch_hand",
+    ):
+        values = [np.asarray(item[key]) for item in observations if key in item]
+        if values:
+            summary[key] = _stat_summary(np.stack(values, axis=0))
+    return summary
+
+
+def prepare_policy_action(
+    action: Any,
+    *,
+    num_envs: int,
+    action_dim: int = EXPECTED_ACTION_DIM,
+) -> np.ndarray:
+    array = np.asarray(action, dtype=np.float32)
+    if array.ndim == 1:
+        array = array[None, :]
+    expected = (int(num_envs), int(action_dim))
+    if tuple(array.shape) != expected:
+        raise ValueError(
+            f"Expected policy action shape {expected}, got {array.shape}. "
+            "This must match the MS-HAB Fetch action contract."
+        )
+    if not np.all(np.isfinite(array)):
+        raise ValueError("Policy returned non-finite MS-HAB actions.")
+    return array
+
+
+def _space_vector(value: Any, *, action_dim: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape == (action_dim,):
+        return array
+    if array.ndim == 2 and array.shape[1] == action_dim:
+        return array[0]
+    return None
+
+
+def action_bounds_from_env(
+    envs: Any, *, action_dim: int = EXPECTED_ACTION_DIM
+) -> tuple[np.ndarray, np.ndarray] | None:
+    for attr in ("single_action_space", "action_space"):
+        space = getattr(envs, attr, None)
+        if space is None:
+            continue
+        low = _space_vector(getattr(space, "low", None), action_dim=action_dim)
+        high = _space_vector(getattr(space, "high", None), action_dim=action_dim)
+        if low is not None and high is not None:
+            return low, high
+    return None
+
+
+class ActionStatsAccumulator:
+    def __init__(
+        self,
+        *,
+        action_dim: int = EXPECTED_ACTION_DIM,
+        bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        self.action_dim = int(action_dim)
+        self.bounds = bounds
+        self.count = 0
+        self.sum = np.zeros((self.action_dim,), dtype=np.float64)
+        self.sum_sq = np.zeros((self.action_dim,), dtype=np.float64)
+        self.min = np.full((self.action_dim,), np.inf, dtype=np.float64)
+        self.max = np.full((self.action_dim,), -np.inf, dtype=np.float64)
+        self.outside_unit = np.zeros((self.action_dim,), dtype=np.int64)
+        self.rows_outside_unit = 0
+        self.outside_bounds = np.zeros((self.action_dim,), dtype=np.int64)
+        self.rows_outside_bounds = 0
+
+    def update(self, action: np.ndarray) -> None:
+        action = prepare_policy_action(
+            action, num_envs=int(action.shape[0]), action_dim=self.action_dim
+        ).astype(np.float64, copy=False)
+        self.count += int(action.shape[0])
+        self.sum += np.sum(action, axis=0)
+        self.sum_sq += np.sum(np.square(action), axis=0)
+        self.min = np.minimum(self.min, np.min(action, axis=0))
+        self.max = np.maximum(self.max, np.max(action, axis=0))
+
+        outside_unit = np.abs(action) > 1.0
+        self.outside_unit += np.sum(outside_unit, axis=0)
+        self.rows_outside_unit += int(np.any(outside_unit, axis=1).sum())
+
+        if self.bounds is not None:
+            low, high = self.bounds
+            outside_bounds = (action < low[None, :]) | (action > high[None, :])
+            self.outside_bounds += np.sum(outside_bounds, axis=0)
+            self.rows_outside_bounds += int(np.any(outside_bounds, axis=1).sum())
+
+    def as_dict(self) -> dict[str, Any]:
+        if self.count == 0:
+            return {"count": 0, "action_dim": self.action_dim}
+        mean = self.sum / float(self.count)
+        var = np.maximum(self.sum_sq / float(self.count) - np.square(mean), 0.0)
+        out: dict[str, Any] = {
+            "count": int(self.count),
+            "action_dim": self.action_dim,
+            "min": self.min.astype(float).tolist(),
+            "max": self.max.astype(float).tolist(),
+            "mean": mean.astype(float).tolist(),
+            "std": np.sqrt(var).astype(float).tolist(),
+            "max_abs": np.maximum(np.abs(self.min), np.abs(self.max))
+            .astype(float)
+            .tolist(),
+            "outside_unit_count": self.outside_unit.astype(int).tolist(),
+            "outside_unit_fraction": (self.outside_unit / float(self.count))
+            .astype(float)
+            .tolist(),
+            "row_fraction_any_outside_unit": float(
+                self.rows_outside_unit / float(self.count)
+            ),
+        }
+        if self.bounds is not None:
+            low, high = self.bounds
+            out.update(
+                {
+                    "bounds_low": low.astype(float).tolist(),
+                    "bounds_high": high.astype(float).tolist(),
+                    "outside_bounds_count": self.outside_bounds.astype(int).tolist(),
+                    "outside_bounds_fraction": (self.outside_bounds / float(self.count))
+                    .astype(float)
+                    .tolist(),
+                    "row_fraction_any_outside_bounds": float(
+                        self.rows_outside_bounds / float(self.count)
+                    ),
+                }
+            )
+        return out
 
 
 def latest_rgb_batch(value: Any, *, key: str) -> np.ndarray | None:
@@ -274,11 +441,17 @@ def main() -> None:
         if not ready:
             raise RuntimeError(f"Praxis policy server is not ready: {info}")
         client.reset()
+        action_bounds = action_bounds_from_env(envs, action_dim=EXPECTED_ACTION_DIM)
+        action_stats = ActionStatsAccumulator(
+            action_dim=EXPECTED_ACTION_DIM, bounds=action_bounds
+        )
+        first_observation_summary: dict[str, Any] | None = None
 
         sum_rewards: list[float] = []
         success_once: list[bool] = []
         success_at_end: list[bool] = []
         lengths: list[int] = []
+        control_steps = 0
         loop_start_time = time.time()
         last_progress_log_time = loop_start_time
         _emit_progress_line(
@@ -294,18 +467,23 @@ def main() -> None:
             observations = build_remote_observations(
                 obs, policy_task=str(args.policy_task)
             )
-            action = np.asarray(
+            if first_observation_summary is None:
+                first_observation_summary = summarize_remote_observation_batch(
+                    observations
+                )
+            action = prepare_policy_action(
                 client.predict_observations(
                     observations,
                     policy_kwargs=policy_kwargs,
                 ),
-                dtype=np.float32,
+                num_envs=int(args.num_envs),
+                action_dim=EXPECTED_ACTION_DIM,
             )
-            if action.ndim == 1:
-                action = action[None, :]
+            action_stats.update(action)
             obs, _reward, _term, _trunc, infos = envs.step(
                 torch.as_tensor(action, device=device)
             )
+            control_steps += 1
             done_mask = to_numpy(
                 infos.get("_episode", np.zeros((args.num_envs,), dtype=bool))
             ).astype(bool)
@@ -328,6 +506,17 @@ def main() -> None:
                     loop_start_time=loop_start_time,
                 )
                 last_progress_log_time = now
+            if args.debug_max_control_steps is not None and control_steps >= int(
+                args.debug_max_control_steps
+            ):
+                print(
+                    "MSHAB_EVAL_DEBUG_MAX_STEPS "
+                    f"task_alias={args.task_alias} "
+                    f"control_steps={control_steps} "
+                    f"episodes_done={len(lengths)}/{args.num_episodes}",
+                    flush=True,
+                )
+                break
 
         limit = int(args.num_episodes)
         sum_rewards = [float(x) for x in sum_rewards[:limit]]
@@ -366,6 +555,15 @@ def main() -> None:
             "lengths": lengths,
             "success_once": success_once,
             "success_at_end": success_at_end,
+            "control_steps": int(control_steps),
+            "debug_max_control_steps": (
+                int(args.debug_max_control_steps)
+                if args.debug_max_control_steps is not None
+                else None
+            ),
+            "debug_truncated_before_episodes": bool(len(lengths) < limit),
+            "action_stats": action_stats.as_dict(),
+            "first_observation_summary": first_observation_summary or {},
             "eval_s": float(time.time() - start),
         }
         metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
