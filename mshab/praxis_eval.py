@@ -182,6 +182,64 @@ def action_bounds_from_env(
     return None
 
 
+def clip_action_to_bounds(
+    action: np.ndarray,
+    bounds: tuple[np.ndarray, np.ndarray] | None,
+) -> np.ndarray:
+    if bounds is None:
+        return action.astype(np.float32, copy=False)
+    low, high = bounds
+    return np.clip(action, low[None, :], high[None, :]).astype(np.float32, copy=False)
+
+
+class ActionClipStatsAccumulator:
+    def __init__(
+        self,
+        *,
+        action_dim: int = EXPECTED_ACTION_DIM,
+        enabled: bool,
+    ) -> None:
+        self.action_dim = int(action_dim)
+        self.enabled = bool(enabled)
+        self.count = 0
+        self.clipped = np.zeros((self.action_dim,), dtype=np.int64)
+        self.rows_clipped = 0
+        self.max_abs_delta = np.zeros((self.action_dim,), dtype=np.float64)
+
+    def update(self, before: np.ndarray, after: np.ndarray) -> None:
+        before = prepare_policy_action(
+            before, num_envs=int(before.shape[0]), action_dim=self.action_dim
+        ).astype(np.float64, copy=False)
+        after = prepare_policy_action(
+            after, num_envs=int(after.shape[0]), action_dim=self.action_dim
+        ).astype(np.float64, copy=False)
+        delta = np.abs(after - before)
+        clipped = delta > 1e-6
+        self.count += int(before.shape[0])
+        self.clipped += np.sum(clipped, axis=0)
+        self.rows_clipped += int(np.any(clipped, axis=1).sum())
+        self.max_abs_delta = np.maximum(self.max_abs_delta, np.max(delta, axis=0))
+
+    def as_dict(self) -> dict[str, Any]:
+        if self.count == 0:
+            return {
+                "enabled": self.enabled,
+                "count": 0,
+                "action_dim": self.action_dim,
+            }
+        return {
+            "enabled": self.enabled,
+            "count": int(self.count),
+            "action_dim": self.action_dim,
+            "clipped_count": self.clipped.astype(int).tolist(),
+            "clipped_fraction": (self.clipped / float(self.count))
+            .astype(float)
+            .tolist(),
+            "row_fraction_any_clipped": float(self.rows_clipped / float(self.count)),
+            "max_abs_delta": self.max_abs_delta.astype(float).tolist(),
+        }
+
+
 class ActionStatsAccumulator:
     def __init__(
         self,
@@ -445,6 +503,13 @@ def main() -> None:
         action_stats = ActionStatsAccumulator(
             action_dim=EXPECTED_ACTION_DIM, bounds=action_bounds
         )
+        policy_action_stats = ActionStatsAccumulator(
+            action_dim=EXPECTED_ACTION_DIM, bounds=action_bounds
+        )
+        action_clip_stats = ActionClipStatsAccumulator(
+            action_dim=EXPECTED_ACTION_DIM,
+            enabled=action_bounds is not None,
+        )
         first_observation_summary: dict[str, Any] | None = None
 
         sum_rewards: list[float] = []
@@ -471,7 +536,7 @@ def main() -> None:
                 first_observation_summary = summarize_remote_observation_batch(
                     observations
                 )
-            action = prepare_policy_action(
+            policy_action = prepare_policy_action(
                 client.predict_observations(
                     observations,
                     policy_kwargs=policy_kwargs,
@@ -479,6 +544,9 @@ def main() -> None:
                 num_envs=int(args.num_envs),
                 action_dim=EXPECTED_ACTION_DIM,
             )
+            policy_action_stats.update(policy_action)
+            action = clip_action_to_bounds(policy_action, action_bounds)
+            action_clip_stats.update(policy_action, action)
             action_stats.update(action)
             obs, _reward, _term, _trunc, infos = envs.step(
                 torch.as_tensor(action, device=device)
@@ -563,6 +631,8 @@ def main() -> None:
             ),
             "debug_truncated_before_episodes": bool(len(lengths) < limit),
             "action_stats": action_stats.as_dict(),
+            "policy_action_stats": policy_action_stats.as_dict(),
+            "action_clip_stats": action_clip_stats.as_dict(),
             "first_observation_summary": first_observation_summary or {},
             "eval_s": float(time.time() - start),
         }
