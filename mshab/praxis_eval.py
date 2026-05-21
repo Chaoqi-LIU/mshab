@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 from mshab.runtime_bootstrap import load_env_factory
-from praxis_client import PolicyClient
+from praxis_remote import PolicyClient
 
 EXPECTED_STATE_DIM = 42
 EXPECTED_ACTION_DIM = 13
@@ -498,7 +498,12 @@ def main() -> None:
         ready, info = client.health_check()
         if not ready:
             raise RuntimeError(f"Praxis policy server is not ready: {info}")
-        client.reset()
+        lane_generations = [0 for _ in range(int(args.num_envs))]
+        episode_ids = [
+            f"{args.task_alias}:lane{lane_idx}:episode0"
+            for lane_idx in range(int(args.num_envs))
+        ]
+        client.reset(episode_ids=episode_ids)
         action_bounds = action_bounds_from_env(envs, action_dim=EXPECTED_ACTION_DIM)
         action_stats = ActionStatsAccumulator(
             action_dim=EXPECTED_ACTION_DIM, bounds=action_bounds
@@ -540,6 +545,7 @@ def main() -> None:
                 client.predict_observations(
                     observations,
                     policy_kwargs=policy_kwargs,
+                    episode_ids=episode_ids,
                 ),
                 num_envs=int(args.num_envs),
                 action_dim=EXPECTED_ACTION_DIM,
@@ -561,6 +567,15 @@ def main() -> None:
                 extend_done_values(lengths, episode_info["l"], done_mask)
                 extend_done_values(success_once, episode_info["s_o"], done_mask)
                 extend_done_values(success_at_end, episode_info["s_e"], done_mask)
+                done_indices = np.flatnonzero(done_mask).astype(int).tolist()
+                done_episode_ids = [episode_ids[index] for index in done_indices]
+                client.reset(episode_ids=done_episode_ids)
+                for index in done_indices:
+                    lane_generations[index] += 1
+                    episode_ids[index] = (
+                        f"{args.task_alias}:lane{index}:"
+                        f"episode{lane_generations[index]}"
+                    )
             now = time.time()
             if np.any(done_mask) or (
                 now - last_progress_log_time >= _PROGRESS_LOG_INTERVAL_SEC
