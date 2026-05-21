@@ -542,7 +542,7 @@ def main() -> None:
                     observations
                 )
             policy_action = prepare_policy_action(
-                client.predict_observations(
+                client.predict_action(
                     observations,
                     policy_kwargs=policy_kwargs,
                     episode_ids=episode_ids,
