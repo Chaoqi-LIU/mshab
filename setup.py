@@ -8,7 +8,7 @@ def read(fname):
 
 
 setup(
-    name="mshab",
+    name="praxis-mshab",
     version="0.0.1",
     long_description=read("README.md"),
 )

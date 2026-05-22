@@ -1,20 +1,20 @@
 # Package ######################################################################
 
 [build-system]
-requires = ["setuptools >= 62.0.0"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mshab"
+name = "praxis-mshab"
 description = "ManiSkill-HAB"
 readme = "README.md"
 requires-python = ">= 3.8"
 authors = [{ name = "Arth Shukla", email = "arshukla@ucsd.edu" }, { name = "Stone Tao", email = "stao@ucsd.edu" }, { name = "Hao Su", email = "haosu@ucsd.edu" }]
-license = { text = "MIT License" }
+maintainers = [{ name = "Chaoqi Liu", email = "liuchaoqi730@gmail.com" }]
+license = "MIT"
 keywords = ["Reinforcement Learning", "Robotics", "Jax", "RL", "AI"]
 classifiers = [
     "Development Status :: 4 - Beta",  # change to `5 - Production/Stable` when ready
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -30,6 +30,11 @@ dependencies = [
     "huggingface_hub[cli]"
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Chaoqi-LIU/mshab"
+Repository = "https://github.com/Chaoqi-LIU/mshab"
+"Maintainer Website" = "https://chaoqi-liu.com"
 
 [project.optional-dependencies]
 
