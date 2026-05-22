@@ -9,6 +9,6 @@ def read(fname):
 
 setup(
     name="praxis-mshab",
-    version="0.0.1.post1",
+    version="0.0.1.post2",
     long_description=read("README.md"),
 )

@@ -9,4 +9,4 @@ dependencies:
   - pip:
       - setuptools<81
       - torch==2.3.1
-      - git+https://github.com/haosulab/ManiSkill.git@mshab
+      - git+https://github.com/haosulab/ManiSkill.git@17121e3f96e3ee3ed0c03610b17f8bc2864617af
